@@ -1,20 +1,109 @@
-// WinApiHook.cpp : This file contains the 'main' function. Program execution begins and ends there.
-//
+#pragma once 
 
-#include <iostream>
+/******************************************************************************
+Module:  APIHook.cpp
+Notices: Copyright (c) 2008 Jeffrey Richter & Christophe Nasarre
+******************************************************************************/
 
-int main()
+#include <Windows.h>
+#include <ImageHlp.h>
+#include <stdio.h>
+
+#pragma comment(lib, "ImageHlp")
+
+#define CRTDLL "UCRTBASED.DLL"
+
+typedef FILE* (_cdecl* MyFileOpen) (const char* path, const char* mode);
+
+void ReplaceIATEntryInOneMod(PCSTR pszCalleeModName,
+	MyFileOpen pfnCurrent, MyFileOpen pfnNew, HMODULE hmodCaller);
+
+static MyFileOpen myFileOpen;
+
+FILE* _cdecl myFopen(const char* path, const char* mode)
 {
-    std::cout << "Hello World!\n";
+	printf("myFopen\n");
+
+	return myFileOpen(path, mode);
 }
 
-// Run program: Ctrl + F5 or Debug > Start Without Debugging menu
-// Debug program: F5 or Debug > Start Debugging menu
+void InitWinApiHook()
+{
+	myFileOpen = (MyFileOpen)GetProcAddress(GetModuleHandle(CRTDLL), "fopen");
 
-// Tips for Getting Started: 
-//   1. Use the Solution Explorer window to add/manage files
-//   2. Use the Team Explorer window to connect to source control
-//   3. Use the Output window to see build output and other messages
-//   4. Use the Error List window to view errors
-//   5. Go to Project > Add New Item to create new code files, or Project > Add Existing Item to add existing code files to the project
-//   6. In the future, to open this project again, go to File > Open > Project and select the .sln file
+	HMODULE hMod = GetModuleHandle("WinApiHook.exe");
+
+	ReplaceIATEntryInOneMod(CRTDLL, myFileOpen, myFopen, hMod);
+}
+
+LONG WINAPI InvalidReadExceptionFilter(PEXCEPTION_POINTERS pep) {
+
+	// handle all unexpected exceptions because we simply don't patch
+	// any module in that case
+	LONG lDisposition = EXCEPTION_EXECUTE_HANDLER;
+
+	// Note: pep->ExceptionRecord->ExceptionCode has 0xc0000005 as a value
+
+	return(lDisposition);
+}
+
+void ReplaceIATEntryInOneMod(PCSTR pszCalleeModName,
+	MyFileOpen pfnCurrent, MyFileOpen pfnNew, HMODULE hmodCaller) {
+
+	// Get the address of the module's import section
+	ULONG ulSize;
+
+	// An exception was triggered by Explorer (when browsing the content of 
+	// a folder) into imagehlp.dll. It looks like one module was unloaded...
+	// Maybe some threading problem: the list of modules from Toolhelp might 
+	// not be accurate if FreeLibrary is called during the enumeration.
+	PIMAGE_IMPORT_DESCRIPTOR pImportDesc = NULL;
+	__try {
+		pImportDesc = (PIMAGE_IMPORT_DESCRIPTOR)ImageDirectoryEntryToData(
+			hmodCaller, TRUE, IMAGE_DIRECTORY_ENTRY_IMPORT, &ulSize);
+	}
+	__except (InvalidReadExceptionFilter(GetExceptionInformation())) {
+		// Nothing to do in here, thread continues to run normally
+		// with NULL for pImportDesc 
+	}
+
+	if (pImportDesc == NULL)
+		return;  // This module has no import section or is no longer loaded
+
+
+	 // Find the import descriptor containing references to callee's functions
+	for (; pImportDesc->Name; pImportDesc++) {
+		PSTR pszModName = (PSTR)((PBYTE)hmodCaller + pImportDesc->Name);
+		if (lstrcmpiA(pszModName, pszCalleeModName) == 0) {
+
+			// Get caller's import address table (IAT) for the callee's functions
+			PIMAGE_THUNK_DATA pThunk = (PIMAGE_THUNK_DATA)
+				((PBYTE)hmodCaller + pImportDesc->FirstThunk);
+
+			// Replace current function address with new function address
+			for (; pThunk->u1.Function; pThunk++) {
+
+				// Get the address of the function address
+				MyFileOpen* ppfn = (MyFileOpen*)&pThunk->u1.Function;
+
+				// Is this the function we're looking for?
+				BOOL bFound = (*ppfn == pfnCurrent);
+				if (bFound) {
+					if (!WriteProcessMemory(GetCurrentProcess(), ppfn, &pfnNew,
+						sizeof(pfnNew), NULL) && (ERROR_NOACCESS == GetLastError())) {
+						DWORD dwOldProtect;
+						if (VirtualProtect(ppfn, sizeof(pfnNew), PAGE_WRITECOPY,
+							&dwOldProtect)) {
+
+							WriteProcessMemory(GetCurrentProcess(), ppfn, &pfnNew,
+								sizeof(pfnNew), NULL);
+							VirtualProtect(ppfn, sizeof(pfnNew), dwOldProtect,
+								&dwOldProtect);
+						}
+					}
+					return;  // We did it, get out
+				}
+			}
+		}  // Each import section is parsed until the right entry is found and patched
+	}
+}
